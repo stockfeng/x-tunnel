@@ -130,6 +130,7 @@ var (
 	connectionNum    int
 	insecure         bool
 	ips              string
+	proxyAddr        string
 
 	dnsServer string
 	echDomain string
@@ -177,6 +178,7 @@ func init() {
 	flag.BoolVar(&fallback, "fallback", false, "是否禁用 ECH 并回落到普通 TLS 1.3（仅 wss 模式生效，默认 false）")
 	flag.IntVar(&connectionNum, "n", 3, "每个IP建立的WebSocket连接数量")
 	flag.StringVar(&ips, "ips", "", "IP 访问策略（TUN 默认双栈；域名出口按该策略解析）\n 4: 仅IPv4\n 6: 仅IPv6\n 4,6: 域名由服务端解析时 IPv4优先\n 6,4: 域名由服务端解析时 IPv6优先")
+	flag.StringVar(&proxyAddr, "proxy", "", "客户端模式：指定服务端前置 socks5 代理地址，如 socks5://admin:admin@warp-go.railway.internal:40000，空=服务端直连")
 }
 
 func main() {
@@ -308,9 +310,13 @@ func main() {
 	}
 
 	clientID = uuid.NewString()
+
+	// 通知服务端所需的前置 SOCKS5 代理地址（空 = 直连）
+	var proxyAddrForServer []byte
+
 	log.Printf("[客户端] 客户端ID: %s", clientID)
 
-	echPool = NewECHPool(forwardAddr, connectionNum, targetIPs, clientID)
+	echPool = NewECHPool(forwardAddr, connectionNum, targetIPs, clientID, proxyAddrForServer)
 	echPool.Start()
 
 	// ================= TUN 模式（仅在 Windows 启用） =================
@@ -1694,26 +1700,44 @@ func handleWebSocketChannel(ch *WSChannel) {
 	}
 }
 
-func readSmuxOpenHeader(r io.Reader) (byte, byte, string, error) {
-	head := make([]byte, 4)
-	if _, err := io.ReadFull(r, head); err != nil {
-		return 0, 0, "", err
+func readSmuxOpenHeader(r io.Reader) (kind byte, strategy byte, proxyFlag byte, target string, err error) {
+	head := make([]byte, 3)
+	if _, err = io.ReadFull(r, head); err != nil {
+		return 0, 0, 0, "", err
 	}
-	kind := head[0]
-	strategy := head[1]
-	targetLen := int(binary.BigEndian.Uint16(head[2:4]))
+	kind = head[0]
+	strategy = head[1]
+	proxyLen := int(head[2])
+	proxyFlag = 0
+	if proxyLen > 0 {
+		proxyRaw := make([]byte, proxyLen)
+		if _, err = io.ReadFull(r, proxyRaw); err != nil {
+			return 0, 0, 0, "", err
+		}
+		// 动态设置 socks5Config 供后续直连/代理连接使用
+		socks5Config, _ = parseSOCKS5Addr(string(proxyRaw))
+		proxyFlag = 1
+		log.Printf("[服务端] 客户端请求 SOCKS5 前置代理: %s", string(proxyRaw))
+	}
+	// 然后再读 2 字节 target length
+	var targetLenBytesBuf [2]byte
+	if _, err = io.ReadFull(r, targetLenBytesBuf[:]); err != nil {
+		return 0, 0, 0, "", err
+	}
+	targetLen := int(binary.BigEndian.Uint16(targetLenBytesBuf[:]))
 	targetRaw := make([]byte, targetLen)
 	if targetLen > 0 {
-		if _, err := io.ReadFull(r, targetRaw); err != nil {
-			return 0, 0, "", err
+		if _, err = io.ReadFull(r, targetRaw); err != nil {
+			return 0, 0, 0, "", err
 		}
 	}
-	return kind, strategy, string(targetRaw), nil
+	target = string(targetRaw)
+	return kind, strategy, proxyFlag, target, nil
 }
 
 func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream) {
 	defer stream.Close()
-	kind, strategy, target, err := readSmuxOpenHeader(stream)
+	kind, strategy, proxyFlag, target, err := readSmuxOpenHeader(stream)
 	if err != nil {
 		return
 	}
@@ -1727,9 +1751,12 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 	case streamKindTCP:
 		log.Printf("[服务端] 客户ID:%s TCP 打开: %s, 通道:%d", shortID(session.clientID), target, ch.id)
 		var tcpConn net.Conn
-		if socks5Config != nil {
+		if proxyFlag == 1 && socks5Config != nil {
 			tcpConn, err = dialViaSocks5("tcp", target)
 		} else {
+			if proxyFlag == 1 {
+				log.Printf("[服务端] 客户端请求前置代理但 socks5Config 未设置，直连")
+			}
 			tcpConn, err = dialTCPWithStrategy(target, strategy)
 		}
 		if err != nil {
@@ -1740,7 +1767,7 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 	case streamKindUDP:
 		log.Printf("[服务端] 客户ID:%s SOCKS5 UDP 访问: %s, 通道:%d", shortID(session.clientID), target, ch.id)
 		var relay UDPRelayer
-		if socks5Config != nil {
+		if proxyFlag == 1 && socks5Config != nil {
 			var socksRelay *SOCKS5UDPRelay
 			socksRelay, err = newSOCKS5UDPRelay(target)
 			if err != nil {
@@ -1749,6 +1776,9 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 			}
 			relay = socksRelay
 		} else {
+			if proxyFlag == 1 {
+				log.Printf("[服务端] 客户端请求 SOCKS5 但 socks5Config 未取，直连")
+			}
 			addr, errResolve := resolveUDPWithStrategy(target, strategy)
 			if errResolve != nil {
 				return
@@ -1808,6 +1838,7 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 type ECHPool struct {
 	wsServerAddr  string
 	connectionNum int
+	proxyAddr     []byte
 	targetIPs     []string
 	clientID      string
 
@@ -1819,7 +1850,7 @@ type ECHPool struct {
 	readyOnce     sync.Once
 }
 
-func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
+func NewECHPool(addr string, n int, ips []string, clientID string, proxyAddr []byte) *ECHPool {
 	total := n
 	if len(ips) > 0 {
 		total = len(ips) * n
@@ -1829,6 +1860,7 @@ func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
 		connectionNum: n,
 		targetIPs:     ips,
 		clientID:      clientID,
+		proxyAddr:     proxyAddr,
 		smuxConns:     make([]*smux.Session, total),
 		channelRTT:    make([]int64, total),
 		readyCh:       make(chan struct{}, 1),
@@ -1968,7 +2000,7 @@ func (p *ECHPool) probeChannelRTTOnce(sess *smux.Session, timeout time.Duration)
 	}
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(timeout))
-	if err := writeSmuxOpenHeader(s, streamKindPing, 0, ""); err != nil {
+	if err := writeSmuxOpenHeader(s, streamKindPing, 0, nil, ""); err != nil {
 		return 0, err
 	}
 	payload := make([]byte, 8)
@@ -2090,14 +2122,16 @@ func (p *ECHPool) HasHealthyChannel() bool {
 	return false
 }
 
-func writeSmuxOpenHeader(w io.Writer, kind byte, strategy byte, target string) error {
+func writeSmuxOpenHeader(w io.Writer, kind byte, strategy byte, proxyAddr []byte, target string) error {
 	if len(target) > 65535 {
 		return fmt.Errorf("目标地址过长")
 	}
-	head := make([]byte, 4)
+	head := make([]byte, 5 + len(proxyAddr))
 	head[0] = kind
 	head[1] = strategy
-	binary.BigEndian.PutUint16(head[2:4], uint16(len(target)))
+	head[2] = byte(len(proxyAddr))
+	copy(head[3:3+len(proxyAddr)], proxyAddr)
+	binary.BigEndian.PutUint16(head[3+len(proxyAddr):5+len(proxyAddr)], uint16(len(target)))
 	if _, err := w.Write(head); err != nil {
 		return err
 	}
@@ -2113,7 +2147,7 @@ func (p *ECHPool) openTCPStream(target string) (*smux.Stream, int, int, error) {
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if err := writeSmuxOpenHeader(s, streamKindTCP, ipStrategy, target); err != nil {
+	if err := writeSmuxOpenHeader(s, streamKindTCP, ipStrategy, p.proxyAddr, target); err != nil {
 		_ = s.Close()
 		return nil, 0, 0, err
 	}
@@ -2125,7 +2159,7 @@ func (p *ECHPool) openUDPStream(target string) (*smux.Stream, int, int, error) {
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if err := writeSmuxOpenHeader(s, streamKindUDP, ipStrategy, target); err != nil {
+	if err := writeSmuxOpenHeader(s, streamKindUDP, ipStrategy, p.proxyAddr, target); err != nil {
 		_ = s.Close()
 		return nil, 0, 0, err
 	}
